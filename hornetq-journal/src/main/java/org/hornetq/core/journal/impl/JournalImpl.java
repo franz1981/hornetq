@@ -36,12 +36,14 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.hornetq.api.core.HornetQBuffer;
 import org.hornetq.api.core.HornetQBuffers;
+import org.hornetq.api.core.HornetQIOErrorException;
 import org.hornetq.api.core.Pair;
 import org.hornetq.core.journal.EncodingSupport;
 import org.hornetq.core.journal.IOAsyncTask;
@@ -214,6 +216,14 @@ public class JournalImpl extends JournalBase implements TestableJournal, Journal
 
    private final Reclaimer reclaimer = new Reclaimer();
 
+   private static final long MOVE_NEXT_FILE_TIMEOUT_NANOS = TimeUnit.MILLISECONDS.toNanos(Long.getLong("journal.timeout", 30000));
+
+   private final AtomicLong lastMoveNextFileActionStartTime = new AtomicLong(NO_START_TIME);
+
+   private static final long NO_START_TIME = Long.MIN_VALUE;
+
+   private Thread criticalFailureChecker;
+
    // Constructors --------------------------------------------------
 
    public JournalImpl(final int fileSize,
@@ -277,6 +287,8 @@ public class JournalImpl extends JournalBase implements TestableJournal, Journal
                                                    minFiles);
 
       this.userVersion = userVersion;
+
+      this.criticalFailureChecker = null;
    }
 
    @Override
@@ -2373,6 +2385,47 @@ public class JournalImpl extends JournalBase implements TestableJournal, Journal
          throw new IllegalStateException("Journal " + this + " is not stopped, state is " + state);
       }
 
+      this.criticalFailureChecker = new Thread(new Runnable() {
+         @Override
+         public void run()
+         {
+            //in order to make it reactive enough
+            final long checkTimeoutPeriodNanos = Math.min(MOVE_NEXT_FILE_TIMEOUT_NANOS / 10, TimeUnit.SECONDS.toNanos(1));
+            long lastFailureTime = NO_START_TIME;
+
+            while (!Thread.interrupted())
+            {
+               LockSupport.parkNanos(checkTimeoutPeriodNanos);
+               if (!Thread.interrupted())
+               {
+                  final long lastMoveNextFileStart = lastMoveNextFileActionStartTime.get();
+                  //consider the timeout (if any) only if is not already handled
+                  if (lastMoveNextFileStart != NO_START_TIME && lastMoveNextFileStart > lastFailureTime)
+                  {
+                     //do not use currentTimeMillis because it is dependent by the OS clock too!!
+                     final long now = System.nanoTime();
+                     if (now >= lastMoveNextFileStart + MOVE_NEXT_FILE_TIMEOUT_NANOS)
+                     {
+                        try
+                        {
+                           //timeout expired
+                           fileFactory.onIOError(new HornetQIOErrorException(), "The journal can't move on a new file: timeout expired!", null);
+                        }
+                        finally
+                        {
+                           lastFailureTime = lastMoveNextFileStart;
+                        }
+                     }
+                  }
+               }
+            }
+         }
+      });
+
+      this.criticalFailureChecker.setName("JournalImpl::CriticalFailureChecker");
+
+      this.criticalFailureChecker.start();
+
       filesExecutor = Executors.newSingleThreadExecutor(new ThreadFactory()
       {
 
@@ -2465,6 +2518,10 @@ public class JournalImpl extends JournalBase implements TestableJournal, Journal
       finally
       {
          journalLock.writeLock().unlock();
+
+         this.criticalFailureChecker.interrupt();
+
+         this.criticalFailureChecker = null;
       }
    }
 
@@ -3209,21 +3266,32 @@ public class JournalImpl extends JournalBase implements TestableJournal, Journal
     */
    private void moveNextFile(final boolean scheduleReclaim) throws Exception
    {
-      filesRepository.closeFile(currentFile);
-
-      currentFile = filesRepository.openFile();
-
-      if (scheduleReclaim)
+      assert lastMoveNextFileActionStartTime.get() == NO_START_TIME : "moveNextFile can't be called by multiple threads concurrently";
+      //marks the start of a moveNextFile activity
+      lastMoveNextFileActionStartTime.lazySet(System.nanoTime());
+      try
       {
-         scheduleReclaim();
-      }
+         filesRepository.closeFile(currentFile);
 
-      if (trace)
+         currentFile = filesRepository.openFile();
+
+         if (scheduleReclaim)
+         {
+            scheduleReclaim();
+         }
+
+         if (trace)
+         {
+            HornetQJournalLogger.LOGGER.movingNextFile(currentFile);
+         }
+
+         fileFactory.activateBuffer(currentFile.getFile());
+      }
+      finally
       {
-         HornetQJournalLogger.LOGGER.movingNextFile(currentFile);
+         //clean up the mark of the current moveNextFile activity
+         lastMoveNextFileActionStartTime.lazySet(NO_START_TIME);
       }
-
-      fileFactory.activateBuffer(currentFile.getFile());
    }
 
    @Override
